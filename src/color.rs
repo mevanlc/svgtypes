@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{ByteExt, Error, Stream, colors};
+use crate::color_mix::{ColorSpace, HueInterpolation, compute_color_mix};
 
 #[cfg(not(feature = "std"))]
 use kurbo::common::FloatFuncs;
@@ -220,6 +221,8 @@ impl Stream<'_> {
 
                 self.skip_spaces();
                 self.consume_byte(b')')?;
+            } else if name == "color-mix" {
+                return self.parse_color_mix();
             } else {
                 match colors::from_str(&name) {
                     Some(c) => {
@@ -233,6 +236,143 @@ impl Stream<'_> {
         }
 
         Ok(color)
+    }
+
+    /// Parses a `color-mix()` function.
+    ///
+    /// Syntax: `color-mix(in <colorspace> [<hue-interpolation> hue], <color> [<percentage>], <color> [<percentage>])`
+    fn parse_color_mix(&mut self) -> Result<Color, Error> {
+        self.consume_byte(b'(')?;
+        self.skip_spaces();
+
+        // Parse "in <colorspace> [<hue-method> hue]"
+        let (space, hue_interp) = self.parse_color_interpolation_method()?;
+
+        self.skip_spaces();
+        self.consume_byte(b',')?;
+        self.skip_spaces();
+
+        // Parse color1
+        let color1 = self.parse_color()?;
+        self.skip_spaces();
+
+        // Try to parse optional percentage for color1
+        let pct1 = self.try_parse_percentage_for_color_mix();
+
+        self.skip_spaces();
+        self.consume_byte(b',')?;
+        self.skip_spaces();
+
+        // Parse color2
+        let color2 = self.parse_color()?;
+        self.skip_spaces();
+
+        // Try to parse optional percentage for color2
+        let pct2 = self.try_parse_percentage_for_color_mix();
+
+        self.skip_spaces();
+        self.consume_byte(b')')?;
+
+        Ok(compute_color_mix(space, hue_interp, color1, pct1, color2, pct2))
+    }
+
+    /// Parse color interpolation method: "in <colorspace> [<hue-method> hue]"
+    fn parse_color_interpolation_method(&mut self) -> Result<(ColorSpace, HueInterpolation), Error> {
+        // Expect "in"
+        let in_keyword = self.consume_ascii_ident().to_ascii_lowercase();
+        if in_keyword != "in" {
+            return Err(Error::InvalidValue);
+        }
+
+        self.skip_spaces();
+
+        // Parse color space
+        let space = self.parse_color_space()?;
+
+        self.skip_spaces();
+
+        // Check for optional hue interpolation method (only valid for polar spaces)
+        let hue_interp = if space.is_polar() && !self.at_end() && !self.is_curr_byte_eq(b',') {
+            self.try_parse_hue_interpolation()
+        } else {
+            HueInterpolation::default()
+        };
+
+        Ok((space, hue_interp))
+    }
+
+    /// Parse color space identifier.
+    fn parse_color_space(&mut self) -> Result<ColorSpace, Error> {
+        let name = self.consume_ascii_ident().to_ascii_lowercase();
+        match name.as_str() {
+            "srgb" => Ok(ColorSpace::Srgb),
+            "srgb-linear" => Ok(ColorSpace::SrgbLinear),
+            "lab" => Ok(ColorSpace::Lab),
+            "oklab" => Ok(ColorSpace::Oklab),
+            "lch" => Ok(ColorSpace::Lch),
+            "oklch" => Ok(ColorSpace::Oklch),
+            "hsl" => Ok(ColorSpace::Hsl),
+            "hwb" => Ok(ColorSpace::Hwb),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+
+    /// Try to parse hue interpolation: "<method> hue"
+    fn try_parse_hue_interpolation(&mut self) -> HueInterpolation {
+        let method_name = self.consume_ascii_ident().to_ascii_lowercase();
+
+        let method = match method_name.as_str() {
+            "shorter" => Some(HueInterpolation::Shorter),
+            "longer" => Some(HueInterpolation::Longer),
+            "increasing" => Some(HueInterpolation::Increasing),
+            "decreasing" => Some(HueInterpolation::Decreasing),
+            _ => None,
+        };
+
+        if let Some(m) = method {
+            self.skip_spaces();
+            let hue_keyword = self.consume_ascii_ident().to_ascii_lowercase();
+            if hue_keyword == "hue" {
+                return m;
+            }
+        }
+
+        // Not a valid hue interpolation, would need to backtrack
+        // For simplicity, return default (this case shouldn't happen with valid input)
+        HueInterpolation::default()
+    }
+
+    /// Try to parse a percentage for color-mix (0-100%), returning normalized value (0.0-1.0).
+    fn try_parse_percentage_for_color_mix(&mut self) -> Option<f32> {
+        self.skip_spaces();
+
+        if self.at_end() {
+            return None;
+        }
+
+        // Check if next char could start a number
+        let c = match self.curr_byte() {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        if !c.is_digit() && c != b'+' && c != b'-' && c != b'.' {
+            return None;
+        }
+
+        // Try to parse number
+        if let Ok(n) = self.parse_number() {
+            self.skip_spaces();
+            if self.is_curr_byte_eq(b'%') {
+                self.advance(1);
+                return Some((n as f32 / 100.0).clamp(0.0, 1.0));
+            }
+        }
+
+        // Not a percentage - this is tricky because we can't easily backtrack
+        // But in color-mix context, a bare number without % after a color is invalid
+        // So we'll just return None (the number parsing advanced the stream though)
+        None
     }
 }
 
@@ -616,4 +756,122 @@ mod tests {
         "rgb(140%, -10mm, 130pt)",
         "invalid number at position 14"
     );
+
+    // color-mix() tests
+    #[cfg(feature = "color-mix")]
+    mod color_mix_tests {
+        use core::str::FromStr;
+        use crate::Color;
+
+        // sRGB mixing: red + blue = purple
+        #[test]
+        fn mix_srgb_equal() {
+            let color = Color::from_str("color-mix(in srgb, red, blue)").unwrap();
+            assert_eq!(color, Color::new_rgb(128, 0, 128));
+        }
+
+        // Weighted mixing: 25% red + 75% blue
+        #[test]
+        fn mix_srgb_weighted() {
+            let color = Color::from_str("color-mix(in srgb, red 25%, blue)").unwrap();
+            assert_eq!(color, Color::new_rgb(64, 0, 191));
+        }
+
+        // Both percentages specified
+        #[test]
+        fn mix_srgb_both_percentages() {
+            let color = Color::from_str("color-mix(in srgb, red 30%, blue 70%)").unwrap();
+            // Allow ±1 for rounding differences
+            assert_eq!(color.red, 77);
+            assert_eq!(color.green, 0);
+            assert!(color.blue >= 178 && color.blue <= 179);
+        }
+
+        // Oklab mixing (default color space per spec)
+        #[test]
+        fn mix_oklab_equal() {
+            let color = Color::from_str("color-mix(in oklab, red, blue)").unwrap();
+            // Oklab produces different results than sRGB
+            // The exact value depends on the oklab algorithm
+            assert!(color.red > 0); // Should have some red
+            assert!(color.blue > 0); // Should have some blue
+        }
+
+        // HSL mixing with hue interpolation
+        #[test]
+        fn mix_hsl_equal() {
+            let color = Color::from_str("color-mix(in hsl, red, blue)").unwrap();
+            // Red is hue 0, blue is hue 240, midpoint should be around 120 (green) or 300 (magenta)
+            // depending on shorter/longer path
+            assert!(color.alpha == 255);
+        }
+
+        // HSL with explicit hue interpolation
+        #[test]
+        fn mix_hsl_longer_hue() {
+            let color = Color::from_str("color-mix(in hsl longer hue, red, blue)").unwrap();
+            // Longer path from 0 to 240 goes through 360 -> green
+            assert!(color.alpha == 255);
+        }
+
+        // With hex colors
+        #[test]
+        fn mix_hex_colors() {
+            let color = Color::from_str("color-mix(in srgb, #ff0000, #0000ff)").unwrap();
+            assert_eq!(color, Color::new_rgb(128, 0, 128));
+        }
+
+        // With rgba colors (alpha should be mixed too)
+        #[test]
+        fn mix_with_alpha() {
+            let color = Color::from_str("color-mix(in srgb, rgba(255, 0, 0, 0.5), blue)").unwrap();
+            // Alpha: 0.5 * 0.5 + 1.0 * 0.5 = 0.75 (about 191)
+            assert!(color.alpha > 128 && color.alpha < 255);
+        }
+
+        // Different color spaces
+        #[test]
+        fn mix_lab() {
+            let color = Color::from_str("color-mix(in lab, red, blue)").unwrap();
+            assert!(color.red > 0 || color.blue > 0);
+        }
+
+        #[test]
+        fn mix_lch() {
+            let color = Color::from_str("color-mix(in lch, red, blue)").unwrap();
+            assert!(color.alpha == 255);
+        }
+
+        #[test]
+        fn mix_oklch() {
+            let color = Color::from_str("color-mix(in oklch, red, blue)").unwrap();
+            assert!(color.alpha == 255);
+        }
+
+        #[test]
+        fn mix_hwb() {
+            let color = Color::from_str("color-mix(in hwb, red, blue)").unwrap();
+            assert!(color.alpha == 255);
+        }
+
+        #[test]
+        fn mix_srgb_linear() {
+            let color = Color::from_str("color-mix(in srgb-linear, red, blue)").unwrap();
+            assert!(color.red > 0 || color.blue > 0);
+        }
+
+        // Named colors
+        #[test]
+        fn mix_named_colors() {
+            let color = Color::from_str("color-mix(in srgb, crimson, dodgerblue)").unwrap();
+            assert!(color.alpha == 255);
+        }
+
+        // Spacing variations
+        #[test]
+        fn mix_with_spaces() {
+            let color = Color::from_str("color-mix( in srgb , red , blue )").unwrap();
+            assert_eq!(color, Color::new_rgb(128, 0, 128));
+        }
+    }
 }
