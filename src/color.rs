@@ -240,17 +240,29 @@ impl Stream<'_> {
 
     /// Parses a `color-mix()` function.
     ///
-    /// Syntax: `color-mix(in <colorspace> [<hue-interpolation> hue], <color> [<percentage>], <color> [<percentage>])`
+    /// Syntax (CSS Color 5): `color-mix([in <colorspace> [<hue-interpolation> hue]]?, <color> [<percentage>]?, <color> [<percentage>]?)`
     fn parse_color_mix(&mut self) -> Result<Color, Error> {
         self.consume_byte(b'(')?;
         self.skip_spaces();
 
-        // Parse "in <colorspace> [<hue-method> hue]"
-        let (space, hue_interp) = self.parse_color_interpolation_method()?;
+        // Parse optional interpolation method: "in <colorspace> [<hue-method> hue],"
+        // When omitted, CSS defaults to "in oklab".
+        let mut space = ColorSpace::Oklab;
+        let mut hue_interp = HueInterpolation::default();
 
-        self.skip_spaces();
-        self.consume_byte(b',')?;
-        self.skip_spaces();
+        let start = self.pos();
+        let ident = self.consume_ascii_ident().to_ascii_lowercase();
+        if ident == "in" {
+            self.skip_spaces();
+            (space, hue_interp) = self.parse_color_interpolation_method_after_in()?;
+
+            self.skip_spaces();
+            self.consume_byte(b',')?;
+            self.skip_spaces();
+        } else {
+            // No interpolation method: rewind and parse the first color directly.
+            self.set_pos(start);
+        }
 
         // Parse color1
         let color1 = self.parse_color()?;
@@ -276,25 +288,26 @@ impl Stream<'_> {
         Ok(compute_color_mix(space, hue_interp, color1, pct1, color2, pct2))
     }
 
-    /// Parse color interpolation method: "in <colorspace> [<hue-method> hue]"
-    fn parse_color_interpolation_method(&mut self) -> Result<(ColorSpace, HueInterpolation), Error> {
-        // Expect "in"
-        let in_keyword = self.consume_ascii_ident().to_ascii_lowercase();
-        if in_keyword != "in" {
-            return Err(Error::InvalidValue);
-        }
-
-        self.skip_spaces();
-
-        // Parse color space
+    /// Parse color interpolation method after consuming the `in` keyword:
+    /// `<colorspace> [<hue-method> hue]`
+    fn parse_color_interpolation_method_after_in(&mut self) -> Result<(ColorSpace, HueInterpolation), Error> {
+        // Parse color space.
         let space = self.parse_color_space()?;
-
         self.skip_spaces();
 
-        // Check for optional hue interpolation method (only valid for polar spaces)
-        let hue_interp = if space.is_polar() && !self.at_end() && !self.is_curr_byte_eq(b',') {
-            self.try_parse_hue_interpolation()
+        // Hue interpolation is only allowed for polar spaces. Harden parsing:
+        // - If space is polar: either `,` (default shorter) OR `<method> hue`
+        // - If space is not polar: must be `,` next
+        let hue_interp = if space.is_polar() {
+            if self.is_curr_byte_eq(b',') {
+                HueInterpolation::default()
+            } else {
+                self.parse_hue_interpolation_strict()?
+            }
         } else {
+            if !self.is_curr_byte_eq(b',') {
+                return Err(Error::InvalidValue);
+            }
             HueInterpolation::default()
         };
 
@@ -317,29 +330,28 @@ impl Stream<'_> {
         }
     }
 
-    /// Try to parse hue interpolation: "<method> hue"
-    fn try_parse_hue_interpolation(&mut self) -> HueInterpolation {
+    /// Parse hue interpolation strictly: `<method> hue`.
+    fn parse_hue_interpolation_strict(&mut self) -> Result<HueInterpolation, Error> {
         let method_name = self.consume_ascii_ident().to_ascii_lowercase();
-
-        let method = match method_name.as_str() {
-            "shorter" => Some(HueInterpolation::Shorter),
-            "longer" => Some(HueInterpolation::Longer),
-            "increasing" => Some(HueInterpolation::Increasing),
-            "decreasing" => Some(HueInterpolation::Decreasing),
-            _ => None,
-        };
-
-        if let Some(m) = method {
-            self.skip_spaces();
-            let hue_keyword = self.consume_ascii_ident().to_ascii_lowercase();
-            if hue_keyword == "hue" {
-                return m;
-            }
+        if method_name.is_empty() {
+            return Err(Error::InvalidValue);
         }
 
-        // Not a valid hue interpolation, would need to backtrack
-        // For simplicity, return default (this case shouldn't happen with valid input)
-        HueInterpolation::default()
+        let method = match method_name.as_str() {
+            "shorter" => HueInterpolation::Shorter,
+            "longer" => HueInterpolation::Longer,
+            "increasing" => HueInterpolation::Increasing,
+            "decreasing" => HueInterpolation::Decreasing,
+            _ => return Err(Error::InvalidValue),
+        };
+
+        self.skip_spaces();
+        let hue_keyword = self.consume_ascii_ident().to_ascii_lowercase();
+        if hue_keyword != "hue" {
+            return Err(Error::InvalidValue);
+        }
+
+        Ok(method)
     }
 
     /// Try to parse a percentage for color-mix (0-100%), returning normalized value (0.0-1.0).
@@ -360,7 +372,8 @@ impl Stream<'_> {
             return None;
         }
 
-        // Try to parse number
+        // Transactional parse: only consume when we see a trailing '%'.
+        let start = self.pos();
         if let Ok(n) = self.parse_number() {
             self.skip_spaces();
             if self.is_curr_byte_eq(b'%') {
@@ -369,9 +382,8 @@ impl Stream<'_> {
             }
         }
 
-        // Not a percentage - this is tricky because we can't easily backtrack
-        // But in color-mix context, a bare number without % after a color is invalid
-        // So we'll just return None (the number parsing advanced the stream though)
+        // Rewind if not a percentage.
+        self.set_pos(start);
         None
     }
 }
@@ -872,6 +884,28 @@ mod tests {
         fn mix_with_spaces() {
             let color = Color::from_str("color-mix( in srgb , red , blue )").unwrap();
             assert_eq!(color, Color::new_rgb(128, 0, 128));
+        }
+
+        // Default interpolation method (omitted `in ...`) should match explicit `in oklab`.
+        #[test]
+        fn mix_default_method_oklab() {
+            let a = Color::from_str("color-mix(red, blue)").unwrap();
+            let b = Color::from_str("color-mix(in oklab, red, blue)").unwrap();
+            assert_eq!(a, b);
+        }
+
+        // Invalid hue interpolation syntax should fail (must be "<method> hue").
+        #[test]
+        fn mix_invalid_hue_syntax_errors() {
+            assert!(Color::from_str("color-mix(in hsl longer, red, blue)").is_err());
+            assert!(Color::from_str("color-mix(in lch shorter, red, blue)").is_err());
+        }
+
+        // Percentages must include '%' if present; bare numbers after a color should error.
+        #[test]
+        fn mix_invalid_percentage_errors() {
+            assert!(Color::from_str("color-mix(in srgb, red 25, blue)").is_err());
+            assert!(Color::from_str("color-mix(in srgb, red, blue 75)").is_err());
         }
     }
 }

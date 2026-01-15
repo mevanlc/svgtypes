@@ -454,7 +454,7 @@ mod tests {
         assert!((mult - 0.5).abs() < 0.001);
 
         // Both zero -> transparent
-        let (p1, p2, mult) = normalize_percentages(Some(0.0), Some(0.0));
+        let (_p1, _p2, mult) = normalize_percentages(Some(0.0), Some(0.0));
         assert!((mult - 0.0).abs() < 0.001);
     }
 

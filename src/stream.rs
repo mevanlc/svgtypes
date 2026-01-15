@@ -113,6 +113,13 @@ impl<'a> Stream<'a> {
         self.pos
     }
 
+    /// Sets the current position in bytes.
+    #[inline]
+    pub(crate) fn set_pos(&mut self, pos: usize) {
+        debug_assert!(pos <= self.text.len());
+        self.pos = pos;
+    }
+
     /// Calculates the current position in chars.
     pub fn calc_char_pos(&self) -> usize {
         self.calc_char_pos_at(self.pos)
